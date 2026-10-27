@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+
+# Local dev home (state, secrets, test vault) — never commit
+.dev/
+secrets/
+*.session
+.env

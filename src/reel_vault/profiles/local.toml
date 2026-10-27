@@ -1,0 +1,28 @@
+# Local development on the laptop. Everything lives under ./.dev (gitignored),
+# including a throwaway test vault, so nothing touches the real Obsidian vault.
+
+[paths]
+home = ".dev"
+vault_dir = "{home}/vault/Saved Reels"
+
+[fetch]
+stop_after_known = 20
+max_posts_per_run = 0
+sleep_min = 5
+sleep_max = 15
+
+[transcribe]
+backend = "groq"
+model = "whisper-large-v3-turbo"
+
+[analyze]
+model = "sonnet"
+
+[storage]
+# Downloads in data/media are deleted once the note is written. Everything
+# processed (caption, transcript, analysis, links) stays in state.db and the
+# thumbnail stays in the vault, so nothing has to be re-fetched later.
+keep_media = false
+
+[doctor]
+require = ["ffmpeg", "claude", "agent-reach"]

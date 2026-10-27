@@ -1,0 +1,27 @@
+# Proxmox LXC (CT 109). The vault is an Obsidian Headless synced copy of "remotmoc".
+
+[paths]
+home = "/opt/reel-vault"
+vault_dir = "{home}/vault/2 - Personal/Saved Reels"
+
+[fetch]
+stop_after_known = 20
+max_posts_per_run = 0
+sleep_min = 5
+sleep_max = 15
+
+[transcribe]
+backend = "groq"
+model = "whisper-large-v3-turbo"
+
+[analyze]
+model = "sonnet"
+
+[storage]
+# Downloads in data/media are deleted once the note is written. Everything
+# processed (caption, transcript, analysis, links) stays in state.db and the
+# thumbnail stays in the vault, so nothing has to be re-fetched later.
+keep_media = false
+
+[doctor]
+require = ["ffmpeg", "claude", "ob", "agent-reach"]

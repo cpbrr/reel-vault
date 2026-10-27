@@ -1,0 +1,26 @@
+[project]
+name = "reel-vault"
+version = "0.1.0"
+description = "Turn Instagram saves into a searchable Obsidian second brain."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "instaloader>=4.14",
+]
+
+[project.optional-dependencies]
+# Import the IG session from Chromium-family browsers (Firefox works without it).
+browser = ["browser-cookie3>=0.20"]
+
+[project.scripts]
+reel-vault = "reel_vault.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
