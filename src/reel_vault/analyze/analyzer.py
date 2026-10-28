@@ -53,10 +53,12 @@ def build_prompt(post, transcript: str | None, images: list[Path], registry: Reg
     )
     image_section = ""
     if images:
-        listing = "\n".join(f"- {p.name}" for p in images)
+        listing = "\n".join(f"- {p.name}{_image_label(p.name)}" for p in images)
         image_section = (
             "\n### Images\n\nThis post's images are in the current directory. "
-            f"Read each one with the Read tool before answering:\n{listing}\n"
+            "Read each one with the Read tool before answering. Use any on-screen text "
+            "(tool or repo names, ingredients, grades, settings, captions burned into the video):"
+            f"\n{listing}\n"
         )
     return template.substitute(
         categories=registry.prompt_listing(),
@@ -69,6 +71,14 @@ def build_prompt(post, transcript: str | None, images: list[Path], registry: Reg
         transcript=transcript or "(no speech)",
         images=image_section,
     )
+
+
+def _image_label(name: str) -> str:
+    if name == "thumb.jpg":
+        return " (cover)"
+    if name.startswith("frame") and "_" in name:
+        return f" (video frame at {name.split('_', 1)[1].removesuffix('.jpg')})"
+    return ""
 
 
 def normalize(analysis: dict, registry: Registry) -> dict:
@@ -90,9 +100,10 @@ def _related(analysis: dict, registry: Registry) -> list[str]:
     """Existing categories only (a related page must already exist), never the primary."""
     if analysis.get("is_meme"):
         return []
-    primary = analysis["category"].casefold()
+    # Memes is "nothing to keep"; a post worth keeping elsewhere isn't also a meme.
+    excluded = {analysis["category"].casefold(), MEMES.casefold()}
     names = (c.name for n in analysis.get("related_categories") or [] if (c := registry.find(n)))
-    return _unique(n for n in names if n.casefold() != primary)[:MAX_RELATED]
+    return _unique(n for n in names if n.casefold() not in excluded)[:MAX_RELATED]
 
 
 def tag_slug(tag: str) -> str:
@@ -116,6 +127,7 @@ def _post_url(post) -> str:
 class ClaudeAnalyzer:
     def __init__(self, model: str = "sonnet"):
         self.model = model
+        self.last_usage: dict = {}  # token counts of the latest call
 
     def analyze(self, post, transcript: str | None, images: list[Path], workdir: Path,
                 registry: Registry) -> dict:
@@ -127,5 +139,7 @@ class ClaudeAnalyzer:
             model=self.model,
             tools=("Read",) if images else (),
             cwd=workdir,
+            usage=(usage := {}),
         )
+        self.last_usage = usage
         return normalize(result, registry)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
 
@@ -88,6 +88,9 @@ def load_config(profile: str | None = None) -> Config:
         vault_dir=resolve("vault_dir", "{home}/vault/Saved Reels"),
     )
     load_env_file(paths.env_file)
+    # Machine-specific vault location (e.g. the real Obsidian vault on this laptop).
+    if vault_override := os.environ.get("REEL_VAULT_VAULT_DIR"):
+        paths = replace(paths, vault_dir=Path(vault_override).expanduser())
 
     transcribe = raw.get("transcribe", {})
     return Config(

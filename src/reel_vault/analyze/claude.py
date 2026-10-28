@@ -37,9 +37,11 @@ def run_claude(
     allowed_tools: tuple[str, ...] = (),
     cwd: Path | None = None,
     timeout: int = 600,
+    usage: dict | None = None,
 ) -> dict:
     """`tools` are the tools Claude can see; `allowed_tools` are permission rules
-    that let them run unattended (e.g. "Bash(agent-reach:*)"). Anything else is denied."""
+    that let them run unattended (e.g. "Bash(agent-reach:*)"). Anything else is denied.
+    `usage`, if given, is filled with the call's token counts and API-equivalent cost."""
     exe = shutil.which("claude")
     if exe is None:
         raise ClaudeError("claude CLI not found on PATH", stop_run=True)
@@ -66,7 +68,7 @@ def run_claude(
     except subprocess.TimeoutExpired as e:
         raise ClaudeError(f"claude timed out after {timeout}s") from e
 
-    return parse_output(proc.stdout, proc.stderr, proc.returncode)
+    return parse_output(proc.stdout, proc.stderr, proc.returncode, usage)
 
 
 def check_auth() -> str:
@@ -97,12 +99,21 @@ def child_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     }
 
 
-def parse_output(stdout: str, stderr: str = "", returncode: int = 0) -> dict:
+USAGE_FIELDS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+
+
+def parse_output(stdout: str, stderr: str = "", returncode: int = 0, usage: dict | None = None) -> dict:
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
         detail = (stderr or stdout).strip()[-500:]
         raise ClaudeError(f"claude exited {returncode}: {detail}", _is_stop_run(detail)) from None
+
+    if usage is not None:
+        raw = data.get("usage") or {}
+        usage.update({key: raw.get(key) or 0 for key in USAGE_FIELDS})
+        usage["cost_usd"] = data.get("total_cost_usd") or 0.0
+        usage["seconds"] = (data.get("duration_ms") or 0) / 1000
 
     if data.get("is_error"):
         message = str(data.get("result") or data.get("subtype") or "unknown error")

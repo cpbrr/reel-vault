@@ -81,12 +81,12 @@ def test_write_is_unique_and_never_overwrites(tmp_path, post):
     thumb.write_bytes(b"jpg")
     writer = VaultWriter(vault)
     first = writer.write(post, ANALYSIS, thumb)
-    assert first.as_posix() == "Job Hunting/2026-09-14 Answer tell me about yourself 3 parts.md"
+    assert first.as_posix() == "Job Hunting/Answer tell me about yourself 3 parts 14-09-2026.md"
     second = writer.write(post, ANALYSIS, thumb)
-    assert second.name == "2026-09-14 Answer tell me about yourself 3 parts (ABC).md"
+    assert second.name == "Answer tell me about yourself 3 parts 14-09-2026 (ABC).md"
     # A fresh writer sees existing files too.
     third = VaultWriter(vault).write(post, ANALYSIS | {"title": "Answer tell me about yourself 3 parts"}, None)
-    assert third.name == "2026-09-14 Answer tell me about yourself 3 parts (ABC 2).md"
+    assert third.name == "Answer tell me about yourself 3 parts 14-09-2026 (ABC 2).md"
 
 
 def test_indexes(tmp_path, post):

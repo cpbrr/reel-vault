@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -123,29 +125,103 @@ def cmd_fetch(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
+def build_pipeline(cfg: Config, state: State, loader, *, analyze: bool = True):
     from reel_vault.analyze.analyzer import ClaudeAnalyzer
     from reel_vault.analyze.enricher import AgentReachEnricher
     from reel_vault.pipeline import Pipeline
     from reel_vault.transcribe.base import make_transcriber
+
+    enricher = None
+    if analyze:
+        if shutil.which("agent-reach"):
+            enricher = AgentReachEnricher(cfg.analyze_model)
+        else:
+            print("agent-reach not on PATH: mentioned tools won't be looked up", file=sys.stderr)
+    return Pipeline(
+        cfg,
+        state,
+        loader,
+        make_transcriber(cfg.transcriber, cfg.transcribe_model),
+        ClaudeAnalyzer(cfg.analyze_model) if analyze else None,
+        enricher=enricher,
+    )
+
+
+def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
+    loader = session.open_session(cfg.paths.session_file)
+    print(f"Logged in as @{loader.context.username}", file=sys.stderr)
+    with State(cfg.paths.state_db) as state:
+        if not args.no_fetch:
+            fetch_saved(cfg, state, loader, limit=None, dry_run=False)
+        report = build_pipeline(cfg, state, loader).process(limit=args.limit or 0, only=args.only)
+    return print_report(report)
+
+
+def cmd_pull(cfg: Config, args: argparse.Namespace) -> int:
+    from reel_vault.state import Status
 
     loader = session.open_session(cfg.paths.session_file)
     print(f"Logged in as @{loader.context.username}", file=sys.stderr)
     with State(cfg.paths.state_db) as state:
         if not args.no_fetch:
             fetch_saved(cfg, state, loader, limit=None, dry_run=False)
-        pipeline = Pipeline(
-            cfg,
-            state,
-            loader,
-            make_transcriber(cfg.transcriber, cfg.transcribe_model),
-            ClaudeAnalyzer(cfg.analyze_model),
-            enricher=AgentReachEnricher(cfg.analyze_model) if shutil.which("agent-reach") else None,
-        )
-        if pipeline.enricher is None:
-            print("agent-reach not on PATH: mentioned tools won't be looked up", file=sys.stderr)
-        report = pipeline.process(limit=args.limit or 0, only=args.only)
+        pipeline = build_pipeline(cfg, state, loader, analyze=False)
+        report = pipeline.process(limit=args.limit or 0, stop_after=Status.TRANSCRIBED)
+        # The free Groq tier caps audio per hour; a backlog pull waits it out.
+        while report.stopped and (wait := _groq_wait(report.stopped)):
+            print(f"waiting {wait / 60:.0f} min for the Groq limit to reset", file=sys.stderr)
+            time.sleep(wait)
+            failed = report.failed
+            report = pipeline.process(limit=args.limit or 0, stop_after=Status.TRANSCRIBED)
+            report.failed[:0] = failed
+        counts = state.counts()
+    print(f"\n{len(report.failed)} failed; ready to analyze: {counts.get(Status.TRANSCRIBED, 0)}, "
+          f"still to download: {counts.get(Status.PENDING, 0) + counts.get(Status.MEDIA, 0)}")
+    for shortcode, error in report.failed:
+        print(f"  FAILED {shortcode}: {error}")
+    if report.stopped:
+        print(f"Stopped early: {report.stopped}")
+    return 1 if report.stopped or report.failed else 0
 
+
+def _groq_wait(stopped: str) -> float | None:
+    match = re.search(r"Groq rate limit, retry after (\d+)s", stopped)
+    return min(max(float(match[1]), 60.0), 3600.0) + 5 if match else None
+
+
+def cmd_analyze(cfg: Config, args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    with State(cfg.paths.state_db) as state:
+        pipeline = build_pipeline(cfg, state, loader=None)
+        report = pipeline.analyze_parallel(limit=args.limit or 0, workers=args.workers, follow=args.follow)
+    elapsed = time.monotonic() - started
+    done = len(report.written) + len(report.failed)
+    print(f"\n{done} posts in {elapsed / 60:.1f} min with {args.workers} workers"
+          + (f" ({elapsed / done:.1f}s per post)" if done else ""))
+    return print_report(report)
+
+
+def cmd_reanalyze(cfg: Config, args: argparse.Namespace) -> int:
+    with State(cfg.paths.state_db) as state:
+        shortcodes = state.reset_for_reanalysis(args.shortcodes or None)
+        print(f"re-analyzing {len(shortcodes)} written posts", file=sys.stderr)
+        if not shortcodes:
+            return 0
+        # Works from the saved transcript; Instagram isn't contacted.
+        report = build_pipeline(cfg, state, loader=None).process(only=shortcodes)
+    return print_report(report)
+
+
+def cmd_rerender(cfg: Config, args: argparse.Namespace) -> int:
+    from reel_vault.pipeline import Pipeline
+
+    with State(cfg.paths.state_db) as state:
+        n = Pipeline(cfg, state, loader=None, transcriber=None, analyzer=None).rerender()
+    print(f"{n} notes rewritten in {cfg.paths.vault_dir}")
+    return 0
+
+
+def print_report(report) -> int:
     print(f"\n{len(report.written)} written, {len(report.failed)} failed")
     for category, title in report.written:
         print(f"  [{category}] {title}")
@@ -153,7 +229,41 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         print(f"  FAILED {shortcode}: {error}")
     if report.stopped:
         print(f"Stopped early: {report.stopped}")
+    if report.usage:
+        u = report.usage
+        tokens_in = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+        print(f"Claude: {tokens_in / 1000:.0f}k tokens in, {u.get('output_tokens', 0) / 1000:.0f}k out, "
+              f"${u.get('cost_usd', 0):.2f} API-equivalent (subscription, not billed)")
     return 1 if report.stopped or report.failed else 0
+
+
+def cmd_categories_merge(cfg: Config, args: argparse.Namespace) -> int:
+    import json
+
+    from reel_vault.categories import Registry
+    from reel_vault.pipeline import Pipeline
+
+    plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    registry = Registry(cfg.categories_file)
+    with State(cfg.paths.state_db) as state:
+        renames = {old: new for new, spec in plan.items() for old in spec.get("from", [])}
+        changed = state.rename_categories(renames)
+        registry.merge(plan, state.category_counts())
+        registry.save()
+        print(f"{changed} posts re-labelled; {len(registry.categories)} categories now")
+        # Moves notes into their new folders and rebuilds the index pages; keeps My notes.
+        n = Pipeline(cfg, state, loader=None, transcriber=None, analyzer=None, registry=registry).rerender()
+    print(f"{n} notes rewritten in {cfg.paths.vault_dir}")
+    return 0
+
+
+def cmd_skip(cfg: Config, args: argparse.Namespace) -> int:
+    with State(cfg.paths.state_db) as state:
+        if args.undo:
+            print(f"{state.unskip()} skipped posts back to pending")
+        else:
+            print(f"{state.skip_after(args.after)} saves after #{args.after} skipped")
+    return 0
 
 
 def cmd_retry(cfg: Config, args: argparse.Namespace) -> int:
@@ -194,6 +304,39 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-fetch", action="store_true", help="only process posts already recorded")
     run.add_argument("--only", nargs="+", metavar="SHORTCODE", help="process just these recorded posts")
     run.set_defaults(func=cmd_run)
+
+    pull = sub.add_parser("pull", help="fetch saves, download and transcribe them; analyze later with run")
+    pull.add_argument("--limit", type=int, help="download at most N posts this run")
+    pull.add_argument("--no-fetch", action="store_true", help="only download posts already recorded")
+    pull.set_defaults(func=cmd_pull)
+
+    analyze = sub.add_parser("analyze", help="Claude stages only, several posts at a time (no Instagram)")
+    analyze.add_argument("--limit", type=int, help="analyze at most N posts")
+    analyze.add_argument("--workers", type=int, default=4, help="parallel claude processes (default 4)")
+    analyze.add_argument("--follow", action="store_true", help="wait for a running pull to make more posts ready")
+    analyze.set_defaults(func=cmd_analyze)
+
+    reanalyze = sub.add_parser("reanalyze", help="re-run Claude on written posts and rewrite their notes")
+    reanalyze.add_argument("shortcodes", nargs="*", metavar="SHORTCODE", help="default: all written posts")
+    reanalyze.set_defaults(func=cmd_reanalyze)
+
+    sub.add_parser(
+        "rerender", help="rewrite all notes from saved data (new naming/template); keeps My notes"
+    ).set_defaults(func=cmd_rerender)
+
+    categories = sub.add_parser("categories", help="manage the emergent categories")
+    categories_sub = categories.add_subparsers(dest="categories_command", required=True)
+    merge = categories_sub.add_parser(
+        "merge", help='apply a merge plan JSON {"New": {"description": "...", "from": ["Old", ...]}}'
+    )
+    merge.add_argument("plan", help="path to the merge plan JSON")
+    merge.set_defaults(func=cmd_categories_merge)
+
+    skip = sub.add_parser("skip", help="leave old saves out: skip unprocessed saves after position N")
+    how_skip = skip.add_mutually_exclusive_group(required=True)
+    how_skip.add_argument("--after", type=int, metavar="N", help="keep saves #1..N (newest first), skip the rest")
+    how_skip.add_argument("--undo", action="store_true", help="put all skipped posts back to pending")
+    skip.set_defaults(func=cmd_skip)
 
     sub.add_parser("retry", help="reset failed posts to pending").set_defaults(func=cmd_retry)
 

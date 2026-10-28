@@ -51,6 +51,7 @@ class Status(StrEnum):
     ANALYZED = "analyzed"
     WRITTEN = "written"
     FAILED = "failed"
+    SKIPPED = "skipped"  # deliberately left out (e.g. a block of old saves); never processed
 
 
 def _now() -> str:
@@ -110,8 +111,8 @@ class State:
 
     def work_queue(self, limit: int = 0) -> list[sqlite3.Row]:
         """Posts still to process, in the order they were first seen (newest save first)."""
-        sql = "SELECT * FROM posts WHERE status NOT IN (?, ?) ORDER BY rowid"
-        params: tuple = (Status.WRITTEN, Status.FAILED)
+        sql = "SELECT * FROM posts WHERE status NOT IN (?, ?, ?) ORDER BY rowid"
+        params: tuple = (Status.WRITTEN, Status.FAILED, Status.SKIPPED)
         if limit:
             sql += " LIMIT ?"
             params += (limit,)
@@ -149,6 +150,61 @@ class State:
             fields["status"] = Status.FAILED
         self._update(shortcode, **fields)
         return failed
+
+    def reset_for_reanalysis(self, shortcodes: list[str] | None = None) -> list[str]:
+        """Send written posts back to the analyze stage. Transcript, enrichment and
+        note_path are kept, so nothing is downloaded again and the note is rewritten in place.
+        Includes posts from an interrupted re-analysis (they still have a note_path)."""
+        rows = self._conn.execute(
+            "SELECT * FROM posts WHERE note_path IS NOT NULL AND status != ? ORDER BY rowid", (Status.FAILED,)
+        ).fetchall()
+        if shortcodes:
+            rows = [row for row in rows if row["shortcode"] in shortcodes]
+        for row in rows:
+            self._update(row["shortcode"], status=Status.TRANSCRIBED, attempts=0, last_error=None)
+        return [row["shortcode"] for row in rows]
+
+    def rename_categories(self, renames: dict[str, str]) -> int:
+        """Rename main and related categories everywhere in state. Returns posts changed."""
+        changed = 0
+        rows = self._conn.execute("SELECT shortcode, category, analysis FROM posts WHERE analysis IS NOT NULL")
+        for row in rows.fetchall():
+            analysis = json.loads(row["analysis"])
+            category = renames.get(row["category"], row["category"])
+            related: list[str] = []
+            for name in analysis.get("related_categories", []):
+                name = renames.get(name, name)
+                if name != category and name not in related:
+                    related.append(name)
+            if category == row["category"] and related == analysis.get("related_categories", []):
+                continue
+            analysis["category"], analysis["related_categories"] = category, related
+            self._update(row["shortcode"], category=category, analysis=json.dumps(analysis))
+            changed += 1
+        return changed
+
+    def category_counts(self) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT category, COUNT(*) AS n FROM posts WHERE category IS NOT NULL GROUP BY category"
+        )
+        return {row["category"]: row["n"] for row in rows}
+
+    def skip_after(self, position: int) -> int:
+        """Skip not-yet-processed saves below `position` in the saved list (1 = newest
+        save when the list was first walked). Returns how many were skipped."""
+        rows = self._conn.execute("SELECT shortcode, status FROM posts ORDER BY rowid").fetchall()
+        targets = [r["shortcode"] for r in rows[position:] if r["status"] in (Status.PENDING, Status.MEDIA)]
+        for shortcode in targets:
+            self._update(shortcode, status=Status.SKIPPED)
+        return len(targets)
+
+    def unskip(self) -> int:
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE posts SET status = ?, updated_at = ? WHERE status = ?",
+                (Status.PENDING, _now(), Status.SKIPPED),
+            )
+        return cur.rowcount
 
     def retry_failed(self) -> int:
         """Send failed posts back to the start of the pipeline."""

@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from reel_vault.media import extract_audio
+from reel_vault.media import extract_audio, extract_frames
 from reel_vault.transcribe import groq
 from reel_vault.transcribe.base import RateLimited, TranscribeError
 
@@ -73,3 +73,28 @@ def test_groq_requires_key(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     with pytest.raises(TranscribeError):
         groq.GroqTranscriber()
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("seconds,expected", [(4, 3), (40, 5), (120, 6)])
+def test_extract_frames_count_and_size(tmp_path, seconds, expected):
+    video = tmp_path / "v.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc=s=1080x1920:d={seconds}:r=5",
+         str(video)],
+        check=True,
+    )
+    frames = extract_frames(video, tmp_path)
+    assert len(frames) == expected
+    assert frames[0].name.startswith("frame00_") and frames[0].name.endswith("s.jpg")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(frames[0])],
+        capture_output=True, text=True, check=True,
+    )
+    assert probe.stdout.strip() == "576,1024"  # long edge scaled to 1024
+
+
+def test_extract_frames_bad_file_is_empty(tmp_path):
+    bad = tmp_path / "v.mp4"
+    bad.write_bytes(b"not a video")
+    assert extract_frames(bad, tmp_path) == []

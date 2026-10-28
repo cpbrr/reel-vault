@@ -1,21 +1,26 @@
 # reel-vault
 
-Turn Instagram saves into a searchable Obsidian second brain: pull new saves every 12h, transcribe, let Claude summarize, extract tips and categorize, then write notes into an Obsidian vault.
+Turn Instagram saves into a searchable Obsidian second brain: pull saves, transcribe, let Claude summarize, extract tips and categorize, then write notes into an Obsidian vault. Runs on a laptop with `uv`.
 
-See [PLAN.md](PLAN.md) for the architecture and milestones.
+See [PLAN.md](PLAN.md) for the architecture, measured numbers and next steps.
 
 > **Account risk.** This automates access to your own Instagram account with your session cookies, which is against Instagram's terms. Keep run frequency low, never share your session file, and use at your own risk.
 
 ## Status
 
-M0–M3 are done and run locally: fetch saves → Groq transcription → Claude analysis + emergent categories → repo lookup via [agent-reach](https://github.com/Panniantong/Agent-Reach) → notes and index pages in the vault. Next: deployment on the homelab (M4).
+Working end to end on Windows: fetch saves → download + video frames → Groq transcription → Claude analysis (parallel workers) + emergent categories → repo lookup via [agent-reach](https://github.com/Panniantong/Agent-Reach) → notes and index pages in the vault. Backlog run in progress; next: category review and save dates. A homelab deploy was dropped; an installable Claude Code skill is the long-term idea.
 
 ## Run
 
 ```bash
 uv run reel-vault doctor                 # tools, secrets, Claude + IG logins
-uv run reel-vault run --limit 5          # fetch new saves, process up to 5
+uv run reel-vault pull                   # fetch saves, download + transcribe + frames (no Claude)
+uv run reel-vault analyze --workers 4 --follow   # Claude stages in parallel, following a running pull
+uv run reel-vault run --limit 5          # everything for up to 5 new saves, one at a time
 uv run reel-vault run --no-fetch --only SHORTCODE ...
+uv run reel-vault rerender               # rewrite all notes from saved data (no API calls)
+uv run reel-vault skip --after 1200      # leave saves below #1200 out (--undo to restore)
+uv run reel-vault reanalyze [SHORTCODE ...]  # re-run Claude on written notes; keeps filename + "My notes"
 uv run reel-vault retry                  # failed posts back to pending
 ```
 

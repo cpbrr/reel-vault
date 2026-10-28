@@ -7,7 +7,7 @@ from reel_vault.config import load_config, load_env_file
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for var in ("REEL_VAULT_PROFILE", "REEL_VAULT_HOME", "RV_TEST_A", "RV_TEST_B"):
+    for var in ("REEL_VAULT_PROFILE", "REEL_VAULT_HOME", "REEL_VAULT_VAULT_DIR", "RV_TEST_A", "RV_TEST_B"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -51,3 +51,9 @@ def test_env_file_does_not_override_existing(monkeypatch, tmp_path):
     load_env_file(env)
     assert os.environ["RV_TEST_A"] == "from-env"
     assert os.environ["RV_TEST_B"] == "quoted"
+
+
+def test_vault_dir_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("REEL_VAULT_HOME", str(tmp_path))
+    monkeypatch.setenv("REEL_VAULT_VAULT_DIR", str(tmp_path / "Real Vault" / "Saved Reels"))
+    assert load_config("local").paths.vault_dir == tmp_path / "Real Vault" / "Saved Reels"

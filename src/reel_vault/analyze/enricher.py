@@ -68,6 +68,7 @@ def clean(resources_: list[dict]) -> list[dict]:
 class AgentReachEnricher:
     def __init__(self, model: str = "sonnet", timeout: int = 600):
         self.model = model
+        self.last_usage: dict = {}  # token counts of the latest call
         self.timeout = timeout
 
     def enrich(self, post, analysis: dict, workdir: Path) -> list[dict]:
@@ -82,6 +83,8 @@ class AgentReachEnricher:
             tools=("Bash",),
             allowed_tools=("Bash(agent-reach:*)",),
             cwd=workdir,
+            usage=(usage := {}),
             timeout=self.timeout,
         )
+        self.last_usage = usage
         return clean(result.get("resources", []))

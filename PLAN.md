@@ -1,286 +1,195 @@
-# reel-vault — Architecture & Build Plan
+# reel-vault — Architecture & Plan
 
-Turn Instagram saves into a searchable Obsidian second brain.
-Every 12h: pull new saves → transcribe → Claude summarizes, extracts tips, categorizes → crawl mentioned repos → write notes into the vault → Obsidian Sync carries them to every device.
+Turn Instagram saves into a searchable Obsidian second brain: pull saves → transcribe → Claude summarizes, extracts tips and categorizes → look up mentioned repos → write notes into the vault. Obsidian Sync carries them to every device.
 
 **Goal:** type `job` (or `climbing`, `claude skill`, `recipe`) in Obsidian search and get the relevant reels, with the tips already pulled out.
 
+**Direction (changed 2026-10-28):** runs on the Windows laptop, not a homelab server. The long-term vision is a Claude Code skill/plugin anyone can install from GitHub (see §9). That is for later; the next steps are finishing the backlog and tidying categories.
+
 ---
 
-## 1. Decisions locked
+## 1. Decisions
 
 | Area | Decision |
 |---|---|
-| Fetch | instaloader, `:saved` via Python API, main IG account session |
-| Host | Proxmox, new LXC **CT 109 `reel-vault`** (Debian 13, 2 cores / 2 GB / 16 GB, Australia/Adelaide; downloads deleted after each note, processed data kept in state.db), same pattern as CT 108 |
-| Schedule | systemd timer, **12:00 and 18:00** Adelaide, `Persistent=true` |
-| Transcription | Groq Whisper API (`whisper-large-v3-turbo`) |
-| Analysis | Claude Code headless (`claude -p`) on Rey's subscription, `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` |
-| Depth | caption + hashtags + transcript (option 4b). Images read only for photo/carousel posts (no audio to transcribe) |
-| Categories | emergent: Claude picks an existing category or creates a new one, plus free tags |
-| Memes | imported as lightweight notes under `Memes/`, tagged `#meme` |
-| Language | summary/tips in English, transcript in original language |
-| Enrichment | agent-reach crawls repos mentioned in tech reels (found via transcript/caption clues, since links are usually comment-gated) |
-| Vault | `P:\remotmoc\2 - Personal\Saved Reels\` — thumbnail + note with transcript, **no mp4** |
-| Sync | Obsidian Headless (`ob sync --continuous`) in CT 109 |
-| Alerts | ntfy |
-| IG saves | never modified |
-| Backlog | hundreds; whole backlog processed on first run |
-| Portability | one core package + per-platform profiles (`homelab` now, `mac` later) |
+| Host | Windows laptop, run from the repo with `uv run reel-vault …` (homelab CT 109 dropped) |
+| Fetch | instaloader, saved posts via the Python API, logged-in session file; IG saves are never modified |
+| Pacing | 3–8 s random pause between Instagram requests on the laptop (`local.toml`) |
+| Media | thumbnail + mono 16 kHz mp3 + 3–6 video frames (one per ~8 s, long edge 1024 px) + up to 6 carousel images; mp4 never kept |
+| Transcription | Groq Whisper `whisper-large-v3-turbo` (free tier), transcript kept in its original language |
+| Analysis | `claude -p` on the Max subscription, Sonnet, structured output; sees caption, hashtags, transcript, cover + frames/images, category list |
+| Enrichment | second `claude -p` call allowed only `agent-reach` (GitHub/web search) to resolve comment-gated repos |
+| Categories | emergent; one main category + up to 2 related (existing only, never Memes) |
+| Memes | notes under `Memes/`, one-line summary, no key points, but full tags/keywords so a specific meme is findable |
+| Language | summary, key points, keywords in English |
+| Vault | `P:\remotmoc\2 - Personal\Saved Reels\` (set by `REEL_VAULT_VAULT_DIR` in `.dev/secrets/.env`) |
+| Notes | named `<title> DD-MM-YYYY.md` (posted date); `/` is not allowed in filenames |
+| Storage | downloads deleted once a note is written; everything processed stays in `state.db`, so nothing is re-done |
+| Backlog | 1830 saves; keep #1–1200 (newest first), skip #1201–1830 (old 2020 meme block, `reel-vault skip --after 1200`) |
 
 ---
 
 ## 2. Architecture
 
 ```
-                    CT 109 reel-vault (Proxmox)
-┌──────────────────────────────────────────────────────────────────┐
-│ reel-vault.timer (12:00, 18:00)                                  │
-│   └─ reel-vault run                                              │
-│        1. fetch     instaloader → new saved posts → state.db     │
-│        2. media     temp download → ffmpeg audio + thumbnail     │
-│        3. transcribe  Groq Whisper                               │
-│        4. analyze   claude -p → JSON (category, tags, tips…)     │
-│        5. enrich    claude -p + agent-reach → repo summaries     │
-│        6. write     markdown note + thumbnail → vault dir        │
-│        7. index     regenerate per-category index notes          │
-│        8. notify    ntfy summary / errors                        │
-│                                                                  │
-│ obsidian-sync.service: ob sync --continuous  (vault dir ⇄ cloud) │
-└──────────────────────────────────────────────────────────────────┘
-                 │ Obsidian Sync (E2E encrypted)
-       ┌─────────┴──────────┐
-  Windows laptop         Phone
-  (Obsidian app — read, search, annotate)
+        pull process (Instagram + Groq)              analyze process (Claude only)
+┌───────────────────────────────────────────┐   ┌──────────────────────────────────────┐
+│ fetch   walk saved list newest-first      │   │ analyze --workers 4 [--follow]       │
+│         → state.db (pending)              │   │  worker threads: claude -p calls     │
+│ media   thumb, video → ffmpeg audio+frames│   │   1. analyze (Sonnet + Read images)  │
+│ transcribe  Groq Whisper                  │   │   2. repo lookup (Bash: agent-reach) │
+│         → transcribed (+ frames.done)     │   │  main thread only: state.db,         │
+└───────────────────┬───────────────────────┘   │   categories.json, vault writes      │
+                    │      shared state.db      │  → note + thumbnail, index pages     │
+                    └──────────────────────────►└──────────────────────────────────────┘
+                                                              │ plain files
+                                                 P:\remotmoc\…\Saved Reels  ── Obsidian Sync ──► phone
 ```
 
-The pipeline only writes plain files into a folder. Whatever syncs that folder (Obsidian Headless here, the Obsidian app on a Mac) does not matter to it.
+The pipeline only writes plain files into a folder; whatever syncs that folder doesn't matter to it.
 
-### Per-post flow
+### Post states
 
-1. **Fetch.** `Profile.get_saved_posts()` iterates newest first. Stop once we hit 20 consecutive already-known shortcodes (fast incremental). The first run walks everything. Sleep 5–15s with jitter between posts to stay gentle on IG.
-2. **Media.**
-   - Video: download to `/tmp`, extract mono 16 kHz mp3 with ffmpeg, delete the mp4.
-   - Photo or carousel: download images to `/tmp` so Claude can read them.
-   - Thumbnail: always saved to the vault, because IG CDN URLs expire.
-3. **Transcribe.** Groq, with the language auto-detected. On rate limits (429) we back off and retry. If the run's budget is exhausted, the post stays `pending` for the next run.
-4. **Analyze.** One `claude -p` call per post. Input is the caption, hashtags, author, transcript, the current category registry, and image paths for photo posts. Output is structured JSON (schema below).
-5. **Enrich.** Only when the analysis returns `repo_hints`. A second `claude -p` call is allowed to run `agent-reach` (GitHub search and read), so it can find the repo from clues like the creator, the repo name, or "comment SKILL for the link". It returns the repo URL, a short README summary, and how to install or use it.
-6. **Write.** Notes are **write-once**: the pipeline never edits a note after creating it, so your own annotations are safe. Only the index notes get regenerated.
-7. **Notify.** ntfy sends one message per run ("12 new reels: 4 Climbing, 3 Claude Skills, 2 Memes…") plus failure alerts: IG session expired, Claude token invalid, ob sync down, more than N failures.
+`pending → media → transcribed → analyzed → written`; `failed` after 3 attempts (`retry` resets), `skipped` for saves deliberately left out (`skip --undo` restores). Every stage saves before the next starts, so a crash or stop resumes exactly where it was.
 
-### State: `state.db` (SQLite)
+### Failure handling
 
-`posts(shortcode PK, url, owner, kind, saved_seen_at, status, attempts, last_error, category, note_path, updated_at)`
+- Instagram session problems, Claude usage/auth limits and long Groq limits stop the run without counting failures. `pull` waits out Groq hourly limits by itself.
+- Other errors count against that post only. A failed repo lookup still writes the note, with the tools marked unresolved.
 
-Status goes `pending → media → transcribed → analyzed → written`, or `failed` after 3 attempts. A crash resumes from the last completed stage. `reel-vault retry` resets failed posts.
+### Claude call settings
 
-### Category registry: `categories.json`
-
-`[{ "name": "Job Hunting", "description": "...", "count": 14 }, ...]`
-
-Every analyze call receives the registry. The prompt rules are:
-- Strongly prefer an existing category.
-- Create a new one only when nothing fits, and give a one-line description.
-- Use Title Case and a broad scope ("Climbing", not "Bouldering Footwork").
-- Optionally list up to 2 `related_categories` (existing ones only). The note stays in its main category folder and is also listed under "Also related" on those index pages.
-
-**Drift control:** `reel-vault categories review` asks Claude to propose merges and renames. It's manual for now; it may become a weekly ntfy suggestion later. Applying a merge moves the files and rewrites the `category` field.
+`claude -p --output-format json --json-schema … --model sonnet --system-prompt <short> --tools <Read | Bash> --setting-sources project --strict-mcp-config --no-session-persistence`, prompt on stdin, 600 s timeout, desktop-app env vars stripped, `CLAUDE_CODE_OAUTH_TOKEN` for auth. Token usage is logged per post and summed per run.
 
 ---
 
-## 3. Analysis output schema
+## 3. Analysis output
 
 ```json
 {
-  "category": "Job Hunting",
+  "category": "AI Tools",
   "new_category_description": null,
-  "related_categories": ["Communication"],
+  "related_categories": ["Career"],
   "is_meme": false,
-  "title": "Answer 'tell me about yourself' in 3 parts",
+  "title": "CareerOps: Claude tool that scores jobs against your CV",
   "summary": "2–4 sentence English summary.",
-  "key_points": ["Present → past → future structure", "Keep it under 90 seconds", "..."],
-  "tags": ["interview", "career", "communication"],
-  "keywords": ["job hunting", "interview prep", "resume", "career advice"],
+  "key_points": ["…"],
+  "tags": ["claude-code", "job-hunting"],
+  "keywords": ["job hunting tool", "resume scoring"],
   "language": "en",
-  "repo_hints": []
+  "transcript_is_speech": true,
+  "repo_hints": [{"query": "career-ops", "evidence": "comment APPLY for the repo"}]
 }
 ```
 
-`keywords` holds search synonyms. They make a search for `job` find a reel that only ever says "interview" or "career".
-
-Memes get `is_meme: true`, a one-line summary, and no key points.
+Python then normalizes: memes forced to `Memes`, category snapped to an existing name, related categories filtered, tags turned into valid Obsidian tags, keywords de-duplicated. `transcript_is_speech: false` (lyrics, filler) drops the transcript from the note.
 
 ---
 
-## 4. Vault layout & note template
+## 4. Vault layout & note
 
 ```
-2 - Personal/Saved Reels/
-├── _attachments/            # <shortcode>.jpg thumbnails
-├── _index/                  # generated, one per category + Home
-│   ├── Home.md
-│   ├── Job Hunting.md
-│   └── Climbing.md
-├── Job Hunting/
-│   └── 2026-10-28 Answer tell me about yourself in 3 parts.md
-├── Claude Skills/
-├── Climbing/
-├── Recipes/
-├── Games/
-├── Setups/
-└── Memes/
+Saved Reels/
+├── _attachments/<shortcode>.jpg
+├── _index/Saved Reels Home.md, Reels - <Category>.md   (regenerated every run; "Also related" section)
+├── AI Tools/CareerOps Claude tool that scores jobs against your CV 18-10-2026.md
+├── Climbing/ …  Memes/ …  Recipes/ …
 ```
 
-(The categories above are examples. The real ones come out of the backlog run.)
+Front matter: `type, category, related_categories, tags, keywords, author, url, shortcode, kind, posted, saved_seen, language`. Body: cover, title, Summary, Key points, Resources (with install line) or "Mentioned tools (link not found)", Caption, Transcript (speech only), My notes.
 
-```markdown
----
-type: saved-reel
-category: Job Hunting
-related_categories: [Communication]
-tags: [saved-reel, interview, career, communication]
-keywords: [job hunting, interview prep, career advice]
-author: "@creatorhandle"
-url: https://www.instagram.com/reel/ABC123/
-shortcode: ABC123
-posted: 2026-09-14
-saved_seen: 2026-10-28
-language: en
----
-
-![[ABC123.jpg|300]]
-
-## Summary
-...
-
-## Key points
-- Present → past → future structure
-- ...
-
-## Resources            <!-- only when enrichment found something -->
-- [owner/repo](https://github.com/owner/repo): what it is, how to install
-
-## Caption
-> original caption
-
-## Transcript
-...full transcript...
-
-## My notes
-<!-- yours; never touched by the pipeline -->
-```
-
-The filename is `<posted date> <title>.md`. The shortcode in the frontmatter is the identity, so a rename on your side never breaks anything.
+New notes never overwrite a file. `reanalyze` and `rerender` rewrite notes but keep everything under **My notes**. The shortcode in the front matter is the identity.
 
 ---
 
-## 5. Repo layout (portable core)
+## 5. Repo layout
 
 ```
 reel-vault/
-├── pyproject.toml                  # uv; entry point `reel-vault`
+├── pyproject.toml, uv.lock          uv; console script `reel-vault`
 ├── src/reel_vault/
-│   ├── cli.py                      # run | status | retry | categories review | doctor
-│   ├── config.py                   # loads profile + .env
-│   ├── state.py                    # SQLite
-│   ├── pipeline.py                 # stage orchestration, budgets, locking
-│   ├── fetch/instagram.py          # instaloader wrapper
-│   ├── media.py                    # ffmpeg audio, thumbnails, image temp files
-│   ├── transcribe/
-│   │   ├── base.py
-│   │   ├── groq.py                 # homelab
-│   │   └── mlx.py                  # mac (later)
-│   ├── analyze/
-│   │   ├── claude.py               # claude -p wrapper, JSON schema, retries
-│   │   └── prompts/{analyze.md,enrich.md,review.md}
-│   ├── vault/
-│   │   ├── writer.py
-│   │   ├── index.py
-│   │   └── templates/note.md.j2
-│   └── notify.py                   # ntfy
-├── profiles/
-│   ├── homelab.toml
-│   └── mac.toml                    # later
-├── deploy/
-│   ├── homelab/
-│   │   ├── setup-ct.sh             # run inside CT 109
-│   │   ├── reel-vault.service      # oneshot, TimeoutStartSec=infinity
-│   │   ├── reel-vault.timer        # 12:00, 18:00 Australia/Adelaide
-│   │   └── obsidian-sync.service   # ob sync --continuous, Restart=always
-│   └── mac/                        # launchd plist + installer (later)
-├── plugin/                         # Claude Code plugin: skill + /reel-vault (later)
-└── tests/
+│   ├── cli.py                       status | doctor | login | fetch | pull | run | analyze |
+│   │                                reanalyze | rerender | skip | retry
+│   ├── config.py                    profile TOML → secrets/.env → env overrides
+│   ├── profiles/{local,homelab}.toml
+│   ├── state.py                     SQLite + migrations
+│   ├── pipeline.py                  sequential stages + parallel analyze
+│   ├── fetch/{session,instagram}.py
+│   ├── media.py                     downloads, ffmpeg audio, frames
+│   ├── transcribe/{base,groq}.py    Transcriber interface (local Whisper can slot in)
+│   ├── analyze/{claude,analyzer,enricher}.py + prompts/{analyze,enrich}.md
+│   ├── categories.py                emergent registry
+│   └── vault/writer.py              notes, indexes, naming, My-notes preservation
+└── tests/                           pytest, fakes for every outside service
 ```
 
-Swapped per platform: the transcriber, the scheduler files, the install flow, and the vault path. Everything else is shared.
+Local data (git-ignored) under `.dev/`: `secrets/` (IG session, `.env`), `data/state.db`, `data/categories.json`, `data/media/` (temporary).
 
 ---
 
-## 6. CT 109 contents (`/opt/reel-vault`)
+## 6. Commands
 
-| Item | Notes |
+```bash
+uv run reel-vault doctor                      # tools, secrets present, Claude + IG logins
+uv run reel-vault pull [--no-fetch]           # fetch saves, download, transcribe, frames
+uv run reel-vault analyze --workers 4 [--follow] [--limit N]   # Claude stages only
+uv run reel-vault run [--no-fetch]            # everything, one post at a time
+uv run reel-vault reanalyze [SHORTCODE ...]   # re-run Claude from saved data
+uv run reel-vault rerender                    # rewrite notes from state.db (free)
+uv run reel-vault skip --after N | --undo
+uv run reel-vault retry                       # failed → pending
+uv run reel-vault status
+```
+
+---
+
+## 7. Measured numbers (2026-10-28)
+
+| Stage | Speed |
 |---|---|
-| Python 3.13 venv via uv | reel-vault + instaloader + agent-reach |
-| ffmpeg | apt |
-| Node 22+ | for `obsidian-headless` and Claude Code |
-| `claude` | native installer |
-| `ob` | `npm i -g obsidian-headless` |
-| `vault/` | Obsidian Headless synced copy of **remotmoc** (full vault, check size) |
-| `secrets/.env` | `GROQ_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `NTFY_TOPIC` — chmod 600 |
-| `secrets/ig-session` | instaloader session — chmod 600 (**anyone with it can use your IG account**) |
-| `data/state.db`, `data/categories.json` | pipeline state |
-| `reel-vault` wrapper | symlinked to `/usr/local/bin`, like `streak` |
+| Fetch saved list | ~200 saves/min (1680 in 8 min) |
+| Pull | ~4.5 posts/min at 3–8 s pauses (pause ~5 s, IG request ~3 s, download + ffmpeg ~4 s, Groq <1 s) |
+| Analyze | ~16 s per Claude call; 4 workers ≈ 900 posts/h, so the pull is the bottleneck |
+| Usage | ~0.14% of the Max 5-hour window and ~0.012% of the weekly limit per post; ≈ $0.07 API-equivalent per post (500 posts: 14.7M tokens in, 0.9M out, $35.53) |
 
-Access is the same as CT 108: `pct push 109 …` / `pct exec 109 -- bash -lc '…'`.
+All 1200 kept saves ≈ 1.7 five-hour windows and ~15% of a week.
 
 ---
 
-## 7. Steps we do together (secrets, never pasted in chat)
+## 8. Status & next steps
 
-1. **IG session.** Log into IG in Firefox on the laptop. Run instaloader's Firefox cookie-import script. `pct push` the session file. Test with `reel-vault doctor`.
-2. **Obsidian Headless.** `pct exec 109 -- bash -lc 'ob login'` (interactive), then `ob sync-setup --vault "remotmoc"` and the first sync.
-3. **Claude token.** Run `claude setup-token` and put the result into `secrets/.env` yourself.
-4. **Groq key.** Create a free key at console.groq.com and add it to `.env`.
-5. **ntfy.** Pick an unguessable topic name and subscribe to it on your phone.
+**Done:** fetch, media + frames, transcription, analysis, related categories, repo lookup, parallel analyze, note naming, rerender/reanalyze, skip, usage logging. ~700 of 1200 notes written so far.
 
----
-
-## 8. Build milestones
-
-| # | Milestone | Done when |
+| # | Next | Done when |
 |---|---|---|
-| M0 | Repo skeleton, config, state, CLI stubs | `reel-vault status` runs |
-| M1 | Fetch | dry-run lists your saved posts with shortcode, kind, caption (run on the laptop first; instaloader works on Windows) |
-| M2 | Transcribe + analyze + write on **5 sample reels** into a test folder | **Checkpoint: we review the notes together and tune the prompts and template before anything touches the real vault** |
-| M3 | Repo enrichment via agent-reach | a Claude-skills reel gets a correct `Resources` section |
-| M4 | Deploy CT 109: setup script, secrets, Obsidian Headless, systemd units, ntfy | a manual `reel-vault run` writes a note that shows up on the laptop |
-| M5 | Backlog run | all saves processed; we review the emergent categories and run `categories review` once |
-| M6 | Timer live | 12:00/18:00 runs send ntfy summaries |
-| Later | Mac profile (mlx-whisper, launchd) + Claude Code plugin, publish to GitHub | |
+| 1 | Finish the backlog (#1–1200) | `status` shows only written/skipped/failed |
+| 2 | Commit the work since the first commit | git history matches what runs |
+| 3 | `categories review`: Claude proposes merges/renames/splits (one-post categories; AI Tools vs Dev Tools vs Software Engineering; maybe split AI Tools); apply moves files + rewrites `category` via rerender | reviewed with Rey, applied |
+| 4 | Save dates: import Instagram's "Download your information" JSON, add a real `saved:` date to each note | backlog notes have true save dates |
+| 5 | Ongoing new saves: decide how they run (manual `run`, or Windows Task Scheduler at 12:00/18:00 while the laptop is awake); `stop_after_known=20` keeps each run short | decided and set up |
+| 6 | Optional: ntfy summary/alert per run | |
+| 7 | Reanalyze the first 22 notes with frames (they predate frame extraction) | |
 
 ---
 
-## 9. Risks & mitigations
+## 9. Future vision (not now): installable Claude Code skill
+
+Publish on GitHub as a Claude Code plugin anyone can install:
+
+- **`/reel-vault-setup`**: installs dependencies (uv, ffmpeg, agent-reach), walks through Instagram login, asks for the vault path and transcription choice (Groq key, or local Whisper on a Mac), writes the config and `.env`, runs `doctor`.
+- **`/reel-vault`**: runs the pipeline (pull + analyze), shows progress and usage, answers "find my reels about X" from the vault.
+- Platform profiles: Windows/Linux (Groq), Mac (mlx-whisper, launchd). The transcriber interface and profile system already allow this.
+
+---
+
+## 10. Risks
 
 | Risk | Mitigation |
 |---|---|
-| IG flags automated access on the main account | 2 runs/day, jitter between posts, backlog paced, residential home IP, never write to IG |
-| instaloader breaks after IG changes | `doctor` check + ntfy alert; pin the version and upgrade deliberately |
-| IG session expires | detected at fetch → ntfy "re-import session" |
-| Claude usage limits during the backlog | posts stay `pending` and resume next run; Sonnet for analysis |
-| Groq free-tier caps (requests and audio seconds) | backoff, carry over to the next run |
-| Category sprawl | strong prefer-existing prompt + `categories review` |
-| Obsidian Headless is beta | `obsidian-sync.service` restarts on failure; notes are write-once, so conflicts are unlikely |
-| Full vault copy on the server | CT disk unencrypted on LVM, same trust level as CT 108; access only through `pct` |
-| Repo not findable (comment-gated, no clues) | `Resources` omitted; a `repo_hint_unresolved` tag lets you find those notes later |
-
----
-
-## 10. To verify at build time
-
-- Current `claude -p` flags for structured output (`--output-format json`, JSON schema support) and image input (`--allowedTools Read`).
-- That instaloader's `get_saved_posts()` still works and which session-import script is current.
-- Groq's current free-tier limits and file-size cap.
-- agent-reach's GitHub channel commands (`agent-reach github …`) and its install method (from GitHub, not PyPI).
-- Whether `ob sync-setup` can limit sync to a subfolder (would avoid the full vault copy).
+| Instagram flags automated access on the main account | paced requests, read-only, home IP; a checkpoint stops the run (re-login with `login --interactive`) |
+| instaloader breaks after IG changes | `doctor`; pin the version, upgrade deliberately |
+| Claude usage limits | runs stop cleanly and resume; ~0.14% of a 5-hour window per post |
+| Groq free-tier caps | `pull` waits them out |
+| Category sprawl (worse with parallel workers) | prefer-existing prompt + `categories review` |
+| `claude` CLI flag changes | one wrapper in `analyze/claude.py`; `doctor` checks login |
+| Repo not findable | listed as "link not found", tagged `repo-hint-unresolved` |

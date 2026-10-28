@@ -110,10 +110,10 @@ def test_build_prompt_includes_post_and_images(tmp_path):
 
 def test_normalize_related_categories_existing_only(tmp_path):
     reg = Registry(tmp_path / "c.json")
-    for name in ("AI Tools", "Career", "Climbing", "Recipes"):
+    for name in ("AI Tools", "Career", "Climbing", "Recipes", "Memes"):
         reg.assign(name, name)
     result = normalize(
-        {"category": "AI Tools", "related_categories": ["career", "AI Tools", "Made Up", "Career",
+        {"category": "AI Tools", "related_categories": ["career", "AI Tools", "memes", "Made Up", "Career",
                                                         "Climbing", "Recipes"],
          "is_meme": False, "tags": [], "keywords": [], "key_points": []},
         reg,
@@ -130,3 +130,24 @@ def test_normalize_memes_have_no_related(tmp_path):
         reg,
     )
     assert result["related_categories"] == []
+
+
+def test_parse_output_fills_usage():
+    usage = {}
+    out = json.dumps({"structured_output": {"ok": True}, "total_cost_usd": 0.0123, "duration_ms": 4200,
+                      "usage": {"input_tokens": 10, "cache_read_input_tokens": 9000, "output_tokens": 300}})
+    assert parse_output(out, usage=usage) == {"ok": True}
+    assert usage["cache_read_input_tokens"] == 9000 and usage["cache_creation_input_tokens"] == 0
+    assert usage["cost_usd"] == 0.0123 and usage["seconds"] == 4.2
+
+
+def test_prompt_labels_cover_and_frames(tmp_path):
+    from reel_vault.analyze.analyzer import build_prompt
+    from reel_vault.categories import Registry
+
+    post = {"owner": "a", "kind": "video", "posted_at": "2026-10-01", "shortcode": "X", "hashtags": "[]",
+            "caption": "c"}
+    prompt = build_prompt(post, "t", [tmp_path / "thumb.jpg", tmp_path / "frame00_4s.jpg"], Registry(tmp_path / "c.json"))
+    assert "- thumb.jpg (cover)" in prompt
+    assert "- frame00_4s.jpg (video frame at 4s)" in prompt
+    assert "on-screen text" in prompt

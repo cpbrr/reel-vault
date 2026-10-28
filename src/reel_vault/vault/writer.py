@@ -38,10 +38,12 @@ def yaml_value(value) -> str:
 
 
 UNRESOLVED_TAG = "repo-hint-unresolved"
+MY_NOTES = "## My notes"
 
 
 def render_note(
-    post, analysis: dict, attachment: str | None, saved_seen: str, resources: list[dict] | None = None
+    post, analysis: dict, attachment: str | None, saved_seen: str, resources: list[dict] | None = None,
+    my_notes: str = "",
 ) -> str:
     """`resources` is the enrich stage's output; None means enrichment didn't run."""
     found = [r for r in resources or [] if r["found"] and r.get("url")]
@@ -89,13 +91,20 @@ def render_note(
     # Song lyrics / background music would only pollute search results.
     if post["transcript"] and analysis.get("transcript_is_speech", True):
         lines += ["## Transcript", post["transcript"], ""]
-    lines += ["## My notes", "", ""]
+    lines += [MY_NOTES, "", *([my_notes, ""] if my_notes else [""])]
     return "\n".join(lines)
 
 
 def _post_url(post) -> str:
     path = "reel" if post["kind"] == "video" else "p"
     return f"https://www.instagram.com/{path}/{post['shortcode']}/"
+
+
+def note_stem(post, analysis: dict) -> str:
+    """"<title> DD-MM-YYYY" (posted date). Filenames can't contain "/"."""
+    posted = (post["posted_at"] or "")[:10]
+    date = f"{posted[8:10]}-{posted[5:7]}-{posted[:4]}" if len(posted) == 10 else ""
+    return safe_name(f"{safe_name(analysis['title'], 68)} {date}")
 
 
 class VaultWriter:
@@ -106,27 +115,57 @@ class VaultWriter:
 
     def write(self, post, analysis: dict, thumbnail: Path | None, resources: list[dict] | None = None) -> Path:
         """Write the note; returns its path relative to the vault dir."""
-        attachment = None
-        if thumbnail and thumbnail.is_file():
-            attachment = f"{post['shortcode']}.jpg"
-            dest = self.vault_dir / ATTACHMENTS / attachment
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(thumbnail, dest)
+        stem = self._unique_stem(post, analysis)
+        path = self._folder(analysis) / f"{stem}.md"
+        with open(path, "x", encoding="utf-8") as f:  # "x": never overwrite
+            f.write(self._render(post, analysis, thumbnail, resources))
+        self._taken.add(stem.casefold())
+        return path.relative_to(self.vault_dir)
 
-        folder = self.vault_dir / safe_name(analysis["category"])
-        folder.mkdir(parents=True, exist_ok=True)
-        base = safe_name(f"{(post['posted_at'] or '')[:10]} {analysis['title']}")
+    def rewrite(self, old_path: str, post, analysis: dict, thumbnail: Path | None,
+                resources: list[dict] | None = None) -> Path:
+        """Replace a note (after re-analysis or a template/naming change), keeping
+        whatever is under "My notes". Renamed/moved if its title or category changed."""
+        old = self.vault_dir / old_path
+        my_notes = ""
+        if old.is_file():
+            marker = f"\n{MY_NOTES}\n"
+            text = old.read_text(encoding="utf-8")
+            if marker in text:
+                my_notes = text.split(marker, 1)[1].strip()
+        self._taken.discard(old.stem.casefold())
+        path = self._folder(analysis) / f"{self._unique_stem(post, analysis)}.md"
+        path.write_text(self._render(post, analysis, thumbnail, resources, my_notes), encoding="utf-8")
+        if path != old and old.is_file():
+            old.unlink()
+            if not any(old.parent.iterdir()):
+                old.parent.rmdir()
+        self._taken.add(path.stem.casefold())
+        return path.relative_to(self.vault_dir)
+
+    def _unique_stem(self, post, analysis: dict) -> str:
+        base = note_stem(post, analysis)
         stem, n = base, 1
         while stem.casefold() in self._taken:
             stem = f"{base} ({post['shortcode']}{f' {n}' if n > 1 else ''})"
             n += 1
-        path = folder / f"{stem}.md"
+        return stem
 
+    def _folder(self, analysis: dict) -> Path:
+        folder = self.vault_dir / safe_name(analysis["category"])
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _render(self, post, analysis, thumbnail, resources, my_notes: str = "") -> str:
+        attachment = f"{post['shortcode']}.jpg"
+        dest = self.vault_dir / ATTACHMENTS / attachment
+        if thumbnail and thumbnail.is_file():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(thumbnail, dest)
+        elif not dest.is_file():  # downloads may be gone; reuse the copy already in the vault
+            attachment = None
         saved_seen = (post["first_seen_at"] or datetime.now(timezone.utc).isoformat())[:10]
-        with open(path, "x", encoding="utf-8") as f:  # "x": never overwrite
-            f.write(render_note(post, analysis, attachment, saved_seen, resources))
-        self._taken.add(stem.casefold())
-        return path.relative_to(self.vault_dir)
+        return render_note(post, analysis, attachment, saved_seen, resources, my_notes)
 
     def write_indexes(self, written_posts, descriptions: dict[str, str]) -> None:
         by_category: dict[str, list] = defaultdict(list)
@@ -136,13 +175,15 @@ class VaultWriter:
             by_category[post["category"]].append((post, analysis))
             for name in analysis.get("related_categories", []):
                 related[name].append((post, analysis))
+        # A related category whose own posts all moved elsewhere gets no page.
+        related = defaultdict(list, {k: v for k, v in related.items() if k in by_category})
 
         index_dir = self.vault_dir / INDEX_DIR
         index_dir.mkdir(parents=True, exist_ok=True)
         for stale in index_dir.glob("Reels - *.md"):
             stale.unlink()
 
-        for category in by_category.keys() | related.keys():
+        for category in by_category:
             posts, also = by_category.get(category, []), related.get(category, [])
             lines = [
                 "---", "type: saved-reels-index", f"category: {yaml_value(category)}", "---", "",

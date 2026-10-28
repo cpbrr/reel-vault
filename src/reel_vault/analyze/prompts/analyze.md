@@ -9,8 +9,8 @@ $categories
 ## Rules
 
 - **category**: pick an existing category whenever it reasonably fits. Create a new one only when nothing fits; then give it a broad Title Case name ("Climbing", not "Bouldering Footwork") and a one-line `new_category_description`. Otherwise `new_category_description` is null.
-- **related_categories**: up to 2 other existing categories this post also clearly belongs to, so it shows up on those pages too (e.g. a Claude skill for writing resumes: category "AI Tools", related "Career"). Only names from the list above, never the main category. Empty when it fits one category; most posts do.
-- **is_meme**: true for jokes, memes and pure entertainment with nothing to learn or keep. Memes go in the "Memes" category, with a one-line summary and empty key_points.
+- **related_categories**: up to 2 other existing categories this post also clearly belongs to, so it shows up on those pages too (e.g. a Claude skill for writing resumes: category "AI Tools", related "Career"). Only names from the list above, never the main category and never "Memes". Empty when it fits one category; most posts do.
+- **is_meme**: true for jokes, memes and pure entertainment with nothing to learn or keep. Memes go in the "Memes" category, with a one-line summary of what happens and empty key_points. Memes still need full tags and keywords so a specific one can be found later: the joke or format, who or what is in it (people, characters, streamer, show, game, anime), memorable quotes or on-screen text, and the mood (e.g. "relatable", "gym humor").
 - **title**: short, specific, describes the content (not clickbait from the caption). No emoji.
 - **summary**: 2-4 sentences in English, whatever language the post is in.
 - **key_points**: the concrete, reusable takeaways in English: tips, steps, techniques, ingredients and method, tool names, settings. Each point should make sense on its own when skimming. Empty for memes. For a climbing send, note the grade, board/angle and any beta.
