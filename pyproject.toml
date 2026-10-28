@@ -11,6 +11,8 @@ dependencies = [
 [project.optional-dependencies]
 # Import the IG session from Chromium-family browsers (Firefox works without it).
 browser = ["browser-cookie3>=0.20"]
+# On-device transcription (transcribe.backend = "local"); no Groq key needed.
+local = ["faster-whisper>=1.1"]
 
 [project.scripts]
 reel-vault = "reel_vault.cli:main"

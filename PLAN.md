@@ -16,7 +16,7 @@ Turn Instagram saves into a searchable Obsidian second brain: pull saves → tra
 | Fetch | instaloader, saved posts via the Python API, logged-in session file; IG saves are never modified |
 | Pacing | 3–8 s random pause between Instagram requests on the laptop (`local.toml`) |
 | Media | thumbnail + mono 16 kHz mp3 + 3–6 video frames (one per ~8 s, long edge 1024 px) + up to 6 carousel images; mp4 never kept |
-| Transcription | Groq Whisper `whisper-large-v3-turbo` (free tier), transcript kept in its original language |
+| Transcription | Groq Whisper `whisper-large-v3-turbo` (free tier) by default, or on-device faster-whisper (`backend = "local"`, `uv sync --extra local`); transcript kept in its original language |
 | Analysis | `claude -p` on the Max subscription, Sonnet, structured output; sees caption, hashtags, transcript, cover + frames/images, category list |
 | Enrichment | second `claude -p` call allowed only `agent-reach` (GitHub/web search) to resolve comment-gated repos |
 | Categories | emergent; one main category + up to 2 related (existing only, never Memes) |

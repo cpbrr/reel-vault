@@ -28,4 +28,8 @@ def make_transcriber(backend: str, model: str | None = None) -> Transcriber:
         from reel_vault.transcribe.groq import GroqTranscriber
 
         return GroqTranscriber(model=model) if model else GroqTranscriber()
+    if backend == "local":
+        from reel_vault.transcribe.local import LocalWhisperTranscriber
+
+        return LocalWhisperTranscriber(model=model) if model else LocalWhisperTranscriber()
     raise SystemExit(f"Unknown transcribe backend {backend!r}")

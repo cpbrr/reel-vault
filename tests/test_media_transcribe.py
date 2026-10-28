@@ -98,3 +98,40 @@ def test_extract_frames_bad_file_is_empty(tmp_path):
     bad = tmp_path / "v.mp4"
     bad.write_bytes(b"not a video")
     assert extract_frames(bad, tmp_path) == []
+
+
+def test_local_backend_uses_ffmpeg_samples(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    import numpy as np
+
+    from reel_vault.transcribe import local
+    from reel_vault.transcribe.base import make_transcriber
+
+    seen = {}
+
+    class FakeModel:
+        def __init__(self, name, device, compute_type):
+            seen["model"] = name
+
+        def transcribe(self, audio, vad_filter):
+            seen["samples"] = audio
+            seg = types.SimpleNamespace(text=" hello there ")
+            return iter([seg]), types.SimpleNamespace(language="en")
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeModel))
+    monkeypatch.setattr(local, "_decode", lambda path: np.zeros(16000, dtype=np.float32))
+    result = make_transcriber("local", "tiny").transcribe(tmp_path / "a.mp3")
+    assert result.text == "hello there" and result.language == "en"
+    assert seen["model"] == "tiny" and len(seen["samples"]) == 16000
+
+
+@needs_ffmpeg
+def test_local_decode_gives_16khz_samples(tmp_path):
+    from reel_vault.transcribe.local import _decode
+
+    video = tmp_path / "v.mp4"
+    _make_video(video, with_audio=True)  # 1 s of tone
+    samples = _decode(video)
+    assert 15000 < len(samples) < 17000
